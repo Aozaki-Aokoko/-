@@ -48,6 +48,9 @@ namespace ScriptCoordOverlay
         public bool IsShorthand; // 简写：<文字/颜色>，本身没有坐标
         public bool IsPlain;     // 标签外的纯文字
         public int OptionsStart = -1; // '/' 选项起始的绝对位置（没有则 -1）
+        public int OptionsLen;        // 选项长度
+        public int TextStart = -1;    // 内容文字的绝对起点
+        public int TextLen;           // 内容文字长度
         public string Raw = "";
         public string Text = "";
         public string X = "";
@@ -104,6 +107,15 @@ namespace ScriptCoordOverlay
             return r;
         }
 
+        /// 含任意对话框控件的区块（跨脚本模式按区块整体配对）
+        public List<ScriptBlock> ElementBlocks()
+        {
+            List<ScriptBlock> r = new List<ScriptBlock>();
+            for (int i = 0; i < Blocks.Count; i++)
+                if (Blocks[i].Elements.Count > 0) r.Add(Blocks[i]);
+            return r;
+        }
+
         public int TagCount()
         {
             int n = 0;
@@ -118,7 +130,14 @@ namespace ScriptCoordOverlay
         public ScriptTag Dst;
         public string BlockName = "";
         public int Index;
-        public string Status = "";   // 相同 / 覆盖 / 缺失
+        public string Status = "";   // 相同 / 覆盖 / 缺失 / 标点 / 编号 / 颜色
+        public bool IsMeta;
+        public bool IsDialog;
+        public string MetaOld = "";
+        public string MetaNew = "";
+        public DialogCmd SrcDlg;
+        public DialogCmd DstDlg;
+        public int BlockIndex;
     }
 
     internal sealed class ScanResult
@@ -126,10 +145,17 @@ namespace ScriptCoordOverlay
         public ScriptDoc Src;
         public ScriptDoc Dst;
         public List<CoordPair> Pairs = new List<CoordPair>();
+        public readonly List<ParaPlan> Plans = new List<ParaPlan>();
         public int BlockA, BlockB, TagA, TagB;
         public bool StructureOk = true;
         public readonly List<string> Warnings = new List<string>();
         public int SameCount, ChangeCount, MissingCount;
+        public int CompleteCount, ButtonChanges, DialogChanges;
+        public int PunctChanges, IdChanges, ColorChanges;
+        public int TotalChanges
+        {
+            get { return ChangeCount + PunctChanges + IdChanges + ColorChanges; }
+        }
     }
 
     internal sealed class ParagraphGroup
@@ -146,7 +172,16 @@ namespace ScriptCoordOverlay
         public DialogCmd SrcDlg;
         public DialogCmd DstDlg;
         public bool IsDialog;
-        public string Status = "";   // 相同 / 覆盖 / 缺失 / 结构异常
+        public bool IsMeta;          // 标点/编号/颜色这类附加变更行
+        public string MetaOld = "";
+        public string MetaNew = "";
+        public string Status = "";   // 相同 / 覆盖 / 缺失 / 结构异常 / 标点 / 编号 / 颜色
+    }
+
+    internal sealed class TextStyle
+    {
+        public bool? ColonFull;   // true=全角 ：，false=半角 :，null=不改
+        public bool? SlashFull;   // true=全角 ／，false=半角 /
     }
 
     internal sealed class ParaPlan
@@ -161,8 +196,21 @@ namespace ScriptCoordOverlay
         public int CompleteCount;   // 简写文本补全为绝对坐标的处数
         public int ButtonChanges;   // 文字按钮替换为图像按钮的处数
         public int KindMismatch;    // 控件种类对不上、跳过的处数
+        public int PunctChanges;    // 标点风格变更的控件数
+        public int IdChanges;       // 图片编号变更的控件数
+        public int ColorChanges;    // 颜色/选项变更的控件数
         public bool FollowAmp = true;
         public bool SyncDialog = true;
+        public bool SyncPunctuation = true;
+        public bool SyncImageIds = true;
+        public bool SyncColors = false;
+        public bool VerifyByBlock = false;   // 跨脚本模式：按 [@] 区块校验
+        public TextStyle Style = new TextStyle();
+
+        public int TotalChanges
+        {
+            get { return ChangeCount + PunctChanges + IdChanges + ColorChanges; }
+        }
     }
 
     internal sealed class Edit
@@ -232,6 +280,11 @@ namespace ScriptCoordOverlay
         // 简写文本 <文字/颜色> 里的选项起点
         private static readonly Regex ShortOptRegex = new Regex(
             @"/(?=(?:FCOLOR|SCOLOR|COLOR|AUTOCOLOR|@))",
+            RegexOptions.Compiled | RegexOptions.Singleline);
+
+        // <ITEMBOX:N:F:M:X:Y:W:H:S:T>：坐标是第 4、5 个字段
+        private static readonly Regex ItemBoxCoordRegex = new Regex(
+            @"^(?<p1>[^:]*):(?<p2>[^:]*):(?<p3>[^:]*):(?<x>-?\d+):(?<y>-?\d+)(?<rest>.*)$",
             RegexOptions.Compiled | RegexOptions.Singleline);
 
         // 自定义对话框：OPENMERCHANTBIGDLG 参数…
@@ -439,6 +492,8 @@ namespace ScriptCoordOverlay
                 string body = nm.Groups["body"].Value;
                 int bodyAbs = ls + st + nm.Groups["body"].Index;   // 相对整行
                 tag.Text = body;
+                tag.TextStart = bodyAbs;
+                tag.TextLen = body.Length;
 
                 if (tag.Kind != ElementKind.ItemBox)
                 {
@@ -447,6 +502,8 @@ namespace ScriptCoordOverlay
                     {
                         tag.HasCoord = true;
                         tag.Text = cm.Groups["text"].Value;
+                        tag.TextStart = bodyAbs + cm.Groups["text"].Index;
+                        tag.TextLen = cm.Groups["text"].Length;
                         tag.X = cm.Groups["x"].Value;
                         tag.Y = cm.Groups["y"].Value;
                         tag.XStart = bodyAbs + cm.Groups["x"].Index;
@@ -454,6 +511,26 @@ namespace ScriptCoordOverlay
                         tag.YStart = bodyAbs + cm.Groups["y"].Index;
                         tag.YLen = cm.Groups["y"].Length;
                         tag.Options = cm.Groups["post"].Value;
+                        if (cm.Groups["post"].Success)
+                        {
+                            tag.OptionsStart = bodyAbs + cm.Groups["post"].Index;
+                            tag.OptionsLen = cm.Groups["post"].Length;
+                        }
+                    }
+                }
+                else
+                {
+                    // <ITEMBOX:N:F:M:X:Y:W:H:S:T>：坐标是第 4、5 个字段
+                    Match im = ItemBoxCoordRegex.Match(body);
+                    if (im.Success)
+                    {
+                        tag.HasCoord = true;
+                        tag.X = im.Groups["x"].Value;
+                        tag.Y = im.Groups["y"].Value;
+                        tag.XStart = bodyAbs + im.Groups["x"].Index;
+                        tag.XLen = im.Groups["x"].Length;
+                        tag.YStart = bodyAbs + im.Groups["y"].Index;
+                        tag.YLen = im.Groups["y"].Length;
                     }
                 }
             }
@@ -466,17 +543,22 @@ namespace ScriptCoordOverlay
                 tag.HasAmp = false;
 
                 Match sm = ShortOptRegex.Match(inner);
+                tag.TextStart = ls + st + 1;
                 if (sm.Success)
                 {
                     tag.Options = inner.Substring(sm.Index);
                     tag.Text = inner.Substring(0, sm.Index);
+                    tag.TextLen = sm.Index;
                     tag.OptionsStart = ls + st + 1 + sm.Index;
+                    tag.OptionsLen = inner.Length - sm.Index;
                 }
                 else
                 {
                     tag.Options = "";
                     tag.Text = inner;
+                    tag.TextLen = inner.Length;
                     tag.OptionsStart = -1;
+                    tag.OptionsLen = 0;
                 }
             }
 
@@ -512,6 +594,8 @@ namespace ScriptCoordOverlay
             p.TagStart = ls + a;
             p.TagEnd = ls + b - 1;
             p.RunEnd = ls + b;
+            p.TextStart = ls + a;
+            p.TextLen = content.Length;
             p.BlockIndex = blk.Index;
             p.Ordinal = blk.Elements.Count;
             blk.Elements.Add(p);
@@ -642,7 +726,8 @@ namespace ScriptCoordOverlay
 
     internal static class OverlayEngine
     {
-        public static ScanResult Scan(string srcPath, string dstPath)
+        public static ScanResult Scan(string srcPath, string dstPath,
+                                      bool syncPunct, bool syncIds, bool syncColors)
         {
             if (string.Equals(Path.GetFullPath(srcPath), Path.GetFullPath(dstPath),
                               StringComparison.OrdinalIgnoreCase))
@@ -652,97 +737,135 @@ namespace ScriptCoordOverlay
             r.Src = ScriptParser.Load(srcPath);
             r.Dst = ScriptParser.Load(dstPath);
 
-            List<ScriptBlock> ga = r.Src.TagBlocks();
-            List<ScriptBlock> gb = r.Dst.TagBlocks();
+            List<ScriptBlock> ga = r.Src.ElementBlocks();
+            List<ScriptBlock> gb = r.Dst.ElementBlocks();
             r.BlockA = ga.Count;
             r.BlockB = gb.Count;
-            r.TagA = r.Src.TagCount();
-            r.TagB = r.Dst.TagCount();
+            r.TagA = CountElements(r.Src);
+            r.TagB = CountElements(r.Dst);
 
             if (ga.Count != gb.Count)
             {
                 r.StructureOk = false;
                 r.Warnings.Add(string.Format(
-                    "可覆盖区块数量不一致：源 {0} 个，目标 {1} 个。", ga.Count, gb.Count));
+                    "可同步区块数量不一致：源 {0} 个，目标 {1} 个。", ga.Count, gb.Count));
             }
 
-            int n = Math.Max(ga.Count, gb.Count);
+            int n = Math.Min(ga.Count, gb.Count);
             int seq = 0;
             for (int i = 0; i < n; i++)
             {
-                ScriptBlock ba = i < ga.Count ? ga[i] : null;
-                ScriptBlock bb = i < gb.Count ? gb[i] : null;
-                int na = ba == null ? 0 : ba.Tags.Count;
-                int nb = bb == null ? 0 : bb.Tags.Count;
+                ScriptBlock ba = ga[i];
+                ScriptBlock bb = gb[i];
 
-                if (ba != null && bb != null && na != nb)
+                if (ba.Elements.Count != bb.Elements.Count)
                 {
                     r.StructureOk = false;
                     r.Warnings.Add(string.Format(
-                        "第 {0} 个区块「{1}」标签数不一致：源 {2} 个，目标 {3} 个。",
-                        i + 1, ba.Name, na, nb));
+                        "第 {0} 个区块「{1}」控件数不一致：源 {2} 个，目标 {3} 个，已跳过。",
+                        i + 1, bb.Name, ba.Elements.Count, bb.Elements.Count));
+                    continue;
                 }
 
-                int m = Math.Max(na, nb);
-                for (int j = 0; j < m; j++)
+                ParaPlan plan = TemplateEngine.BuildPlan(r.Dst, ba,
+                    new List<ScriptBlock>(new ScriptBlock[] { bb }),
+                    true, false, syncPunct, syncIds, syncColors);
+                plan.VerifyByBlock = true;
+                r.Plans.Add(plan);
+
+                r.ChangeCount += plan.ChangeCount;
+                r.SameCount += plan.SameCount;
+                r.MissingCount += plan.MissingCount;
+                r.CompleteCount += plan.CompleteCount;
+                r.ButtonChanges += plan.ButtonChanges;
+                r.PunctChanges += plan.PunctChanges;
+                r.IdChanges += plan.IdChanges;
+                r.ColorChanges += plan.ColorChanges;
+
+                foreach (ParaPair pp in plan.Pairs)
                 {
-                    CoordPair p = new CoordPair();
-                    p.BlockName = ba != null ? ba.Name : (bb != null ? bb.Name : "");
-                    p.Src = j < na ? ba.Tags[j] : null;
-                    p.Dst = j < nb ? bb.Tags[j] : null;
-                    p.Index = ++seq;
+                    CoordPair cp = new CoordPair();
+                    cp.Src = pp.Src;
+                    cp.Dst = pp.Dst;
+                    cp.BlockName = bb.Name;
+                    cp.Index = ++seq;
+                    cp.Status = pp.Status;
+                    cp.IsMeta = pp.IsMeta;
+                    cp.MetaOld = pp.MetaOld;
+                    cp.MetaNew = pp.MetaNew;
+                    r.Pairs.Add(cp);
+                }
 
-                    if (p.Src == null || p.Dst == null || !p.Src.HasCoord || !p.Dst.HasCoord)
-                        p.Status = "缺失";
-                    else if (p.Src.X == p.Dst.X && p.Src.Y == p.Dst.Y && p.Src.HasAmp == p.Dst.HasAmp)
-                        p.Status = "相同";
+                int nd = Math.Min(ba.Dialogs.Count, bb.Dialogs.Count);
+                for (int j = 0; j < nd; j++)
+                {
+                    CoordPair cp = new CoordPair();
+                    cp.IsDialog = true;
+                    cp.BlockName = bb.Name;
+                    cp.BlockIndex = bb.Index;
+                    cp.SrcDlg = ba.Dialogs[j];
+                    cp.DstDlg = bb.Dialogs[j];
+                    cp.Index = ++seq;
+
+                    if (ba.Dialogs[j].Args == bb.Dialogs[j].Args)
+                    {
+                        cp.Status = "相同";
+                        r.SameCount++;
+                    }
                     else
-                        p.Status = "覆盖";
-
-                    if (p.Status == "缺失") r.MissingCount++;
-                    else if (p.Status == "相同") r.SameCount++;
-                    else r.ChangeCount++;
-
-                    r.Pairs.Add(p);
+                    {
+                        cp.Status = "覆盖";
+                        r.ChangeCount++;
+                        r.DialogChanges++;
+                    }
+                    r.Pairs.Add(cp);
                 }
             }
+
             return r;
+        }
+
+        private static int CountElements(ScriptDoc doc)
+        {
+            int n = 0;
+            for (int i = 0; i < doc.Blocks.Count; i++) n += doc.Blocks[i].Elements.Count;
+            return n;
         }
 
         public static string BuildNewText(ScanResult r)
         {
             List<Edit> edits = new List<Edit>();
+            foreach (ParaPlan plan in r.Plans)
+                TemplateEngine.CollectEdits(plan, edits);
 
-            for (int i = 0; i < r.Pairs.Count; i++)
+            foreach (CoordPair p in r.Pairs)
             {
-                CoordPair p = r.Pairs[i];
-                if (p.Src == null || p.Dst == null) continue;
-                if (!p.Src.HasCoord || !p.Dst.HasCoord) continue;
-                if (p.Src.X == p.Dst.X && p.Src.Y == p.Dst.Y && p.Src.HasAmp == p.Dst.HasAmp) continue;
-
-                TextEdits.AddAmpEdits(edits, p.Dst, p.Src.HasAmp);
-                TextEdits.AddCoordEdits(edits, p.Src, p.Dst);
+                if (!p.IsDialog || p.SrcDlg == null || p.DstDlg == null) continue;
+                if (p.SrcDlg.Args == p.DstDlg.Args) continue;
+                edits.Add(new Edit
+                {
+                    Start = p.DstDlg.ArgStart,
+                    Len = p.DstDlg.ArgLen,
+                    Value = p.SrcDlg.Args
+                });
             }
             return TextEdits.Apply(r.Dst.Text, edits);
         }
 
         public static int Verify(ScanResult r, string dstText)
         {
-            ScriptDoc d2 = ScriptParser.ParseText(dstText, r.Dst.Path);
-            List<ScriptBlock> ga = r.Src.TagBlocks();
-            List<ScriptBlock> gb = d2.TagBlocks();
             int bad = 0;
-            int n = Math.Min(ga.Count, gb.Count);
-            for (int i = 0; i < n; i++)
+            foreach (ParaPlan plan in r.Plans)
+                bad += TemplateEngine.Verify(plan, dstText);
+
+            ScriptDoc d2 = ScriptParser.ParseText(dstText, r.Dst.Path);
+            foreach (CoordPair p in r.Pairs)
             {
-                int m = Math.Min(ga[i].Tags.Count, gb[i].Tags.Count);
-                for (int j = 0; j < m; j++)
-                {
-                    ScriptTag a = ga[i].Tags[j];
-                    ScriptTag b = gb[i].Tags[j];
-                    if (!a.HasCoord || !b.HasCoord) continue;
-                    if (a.X != b.X || a.Y != b.Y || a.HasAmp != b.HasAmp) bad++;
-                }
+                if (!p.IsDialog || p.SrcDlg == null || p.DstDlg == null) continue;
+                if (p.BlockIndex < 0 || p.BlockIndex >= d2.Blocks.Count) { bad++; continue; }
+                ScriptBlock nb = d2.Blocks[p.BlockIndex];
+                if (p.DstDlg.Ordinal >= nb.Dialogs.Count) { bad++; continue; }
+                if (nb.Dialogs[p.DstDlg.Ordinal].Args != p.SrcDlg.Args) bad++;
             }
             return bad;
         }
@@ -750,12 +873,15 @@ namespace ScriptCoordOverlay
         public static string BuildReport(ScanResult r, bool applied)
         {
             StringBuilder sb = new StringBuilder();
-            sb.AppendLine("坐标覆盖记录  " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
-            sb.AppendLine("源（基准）  ：" + r.Src.Path);
-            sb.AppendLine("目标（被覆盖）：" + r.Dst.Path);
+            sb.AppendLine("脚本同步记录  " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+            sb.AppendLine("源（模板）  ：" + r.Src.Path);
+            sb.AppendLine("目标        ：" + r.Dst.Path);
             sb.AppendLine("状态        ：" + (applied ? "已写入" : "仅预览"));
-            sb.AppendLine(string.Format("匹配 {0} 处：需覆盖 {1}，已一致 {2}，缺失 {3}",
-                r.Pairs.Count, r.ChangeCount, r.SameCount, r.MissingCount));
+            sb.AppendLine(string.Format(
+                "配对 {0} 行：覆盖 {1}（补全 {2}），标点 {3}，编号 {4}，颜色 {5}，已一致 {6}，缺失 {7}",
+                r.Pairs.Count, r.ChangeCount, r.CompleteCount,
+                r.PunctChanges, r.IdChanges, r.ColorChanges,
+                r.SameCount, r.MissingCount));
             if (r.Warnings.Count > 0)
             {
                 sb.AppendLine("结构提示：");
@@ -765,6 +891,25 @@ namespace ScriptCoordOverlay
             sb.AppendLine("序号\t区块\t行\t源坐标\t目标坐标\t写法\t状态");
             foreach (CoordPair p in r.Pairs)
             {
+                if (p.IsMeta)
+                {
+                    string oldv = p.MetaOld.Length == 0 ? "无" : p.MetaOld;
+                    string newv = p.MetaNew.Length == 0 ? "无" : p.MetaNew;
+                    sb.AppendLine(string.Format("{0}\t{1}\t-\t-\t-\t-\t{2}",
+                        p.Index, p.BlockName,
+                        (oldv + " → " + newv).Replace("\t", " ")));
+                    continue;
+                }
+
+                if (p.IsDialog)
+                {
+                    string s = p.SrcDlg != null ? p.SrcDlg.Args : "-";
+                    string d = p.DstDlg != null ? p.DstDlg.Args : "-";
+                    sb.AppendLine(string.Format("{0}\t{1}\t框\t{2}\t{3}\t-\t{4}",
+                        p.Index, p.BlockName, s, d, p.Status));
+                    continue;
+                }
+
                 string sxy = p.Src != null && p.Src.HasCoord ? p.Src.X + ":" + p.Src.Y : "-";
                 string dxy = p.Dst != null && p.Dst.HasCoord ? p.Dst.X + ":" + p.Dst.Y : "-";
                 int line = p.Src != null ? p.Src.LineNo : (p.Dst != null ? p.Dst.LineNo : 0);
@@ -876,7 +1021,8 @@ namespace ScriptCoordOverlay
 
         public static ParaPlan BuildPlan(ScriptDoc doc, ScriptBlock template,
                                          List<ScriptBlock> targets, bool followAmp,
-                                         bool syncDialog)
+                                         bool syncDialog, bool syncPunct,
+                                         bool syncIds, bool syncColors)
         {
             ParaPlan plan = new ParaPlan();
             plan.Doc = doc;
@@ -884,6 +1030,10 @@ namespace ScriptCoordOverlay
             plan.Targets = targets;
             plan.FollowAmp = followAmp;
             plan.SyncDialog = syncDialog;
+            plan.SyncPunctuation = syncPunct;
+            plan.SyncImageIds = syncIds;
+            plan.SyncColors = syncColors;
+            plan.Style = DetectStyle(template);
 
             foreach (ScriptBlock tb in targets)
             {
@@ -966,7 +1116,7 @@ namespace ScriptCoordOverlay
                 if (exact)
                 {
                     for (int j = 0; j < template.Elements.Count; j++)
-                        AddElementPair(plan, tb, template.Elements[j], tb.Elements[j], followAmp);
+                        PairElements(plan, tb, template.Elements[j], tb.Elements[j], followAmp);
                 }
                 else
                 {
@@ -980,7 +1130,7 @@ namespace ScriptCoordOverlay
                         List<int[]> pairs = AlignLine(a, b);
                         foreach (int[] pr in pairs)
                         {
-                            AddElementPair(plan, tb, a[pr[0]], b[pr[1]], followAmp);
+                            PairElements(plan, tb, a[pr[0]], b[pr[1]], followAmp);
                             matched[pr[0]] = true;
                             used[pr[1]] = true;
                         }
@@ -994,7 +1144,7 @@ namespace ScriptCoordOverlay
                             if (q >= b.Count) break;
                             if (!CompatiblePair(a[k], b[q])) continue;
 
-                            AddElementPair(plan, tb, a[k], b[q], followAmp);
+                            PairElements(plan, tb, a[k], b[q], followAmp);
                             matched[k] = true;
                             used[q] = true;
                         }
@@ -1023,6 +1173,131 @@ namespace ScriptCoordOverlay
             bool ta = a.Kind == ElementKind.Text || a.IsPlain;
             bool tb = b.Kind == ElementKind.Text || b.IsPlain;
             return ta && tb;
+        }
+
+        private static bool IsTextual(ScriptTag t)
+        {
+            return t.Kind == ElementKind.Text || t.IsPlain;
+        }
+
+        private static void PairElements(ParaPlan plan, ScriptBlock tb, ScriptTag src, ScriptTag dst, bool followAmp)
+        {
+            AddElementPair(plan, tb, src, dst, followAmp);
+            ParaPair last = plan.Pairs[plan.Pairs.Count - 1];
+            if (last.Status == "缺失" || last.Status == "种类不同" || last.Status == "结构异常") return;
+            AddMetaPairs(plan, tb, src, dst);
+        }
+
+        /// 标点风格、图片编号、颜色这三类附加变更，单独出一行方便预览
+        private static void AddMetaPairs(ParaPlan plan, ScriptBlock tb, ScriptTag src, ScriptTag dst)
+        {
+            if (plan.SyncPunctuation && IsTextual(src) && IsTextual(dst) && dst.TextStart >= 0)
+            {
+                string mapped = MapPunctuation(dst.Text, plan.Style);
+                if (mapped != dst.Text)
+                {
+                    ParaPair m = new ParaPair();
+                    m.TargetBlock = tb;
+                    m.Src = src;
+                    m.Dst = dst;
+                    m.IsMeta = true;
+                    m.Status = "标点";
+                    m.MetaOld = dst.Text;
+                    m.MetaNew = mapped;
+                    plan.Pairs.Add(m);
+                    plan.PunctChanges++;
+                }
+            }
+
+            if (plan.SyncImageIds && src.Kind == ElementKind.Image && dst.Kind == ElementKind.Image &&
+                dst.TextStart >= 0 && src.TextStart >= 0 && src.Text != dst.Text)
+            {
+                ParaPair m = new ParaPair();
+                m.TargetBlock = tb;
+                m.Src = src;
+                m.Dst = dst;
+                m.IsMeta = true;
+                m.Status = "编号";
+                m.MetaOld = dst.Text;
+                m.MetaNew = src.Text;
+                plan.Pairs.Add(m);
+                plan.IdChanges++;
+            }
+
+            if (plan.SyncColors && IsTextual(src) && IsTextual(dst))
+            {
+                string merged = MergeOptions(src.Options, dst.Options);
+                if (merged != dst.Options)
+                {
+                    ParaPair m = new ParaPair();
+                    m.TargetBlock = tb;
+                    m.Src = src;
+                    m.Dst = dst;
+                    m.IsMeta = true;
+                    m.Status = "颜色";
+                    m.MetaOld = dst.Options;
+                    m.MetaNew = merged;
+                    plan.Pairs.Add(m);
+                    plan.ColorChanges++;
+                }
+            }
+        }
+
+        /// 统计模板段落内容文字里的标点风格；打平或没出现就不改
+        private static TextStyle DetectStyle(ScriptBlock b)
+        {
+            int colonFull = 0, colonHalf = 0, slashFull = 0, slashHalf = 0;
+            foreach (ScriptTag t in b.Elements)
+            {
+                if (!IsTextual(t)) continue;
+                string s = t.Text ?? "";
+                foreach (char c in s)
+                {
+                    if (c == '：') colonFull++;
+                    else if (c == ':') colonHalf++;
+                    else if (c == '／') slashFull++;
+                    else if (c == '/') slashHalf++;
+                }
+            }
+
+            TextStyle st = new TextStyle();
+            if (colonFull != colonHalf) st.ColonFull = colonFull > colonHalf;
+            if (slashFull != slashHalf) st.SlashFull = slashFull > slashHalf;
+            return st;
+        }
+
+        private static string MapPunctuation(string text, TextStyle st)
+        {
+            if (text == null || (st.ColonFull == null && st.SlashFull == null)) return text;
+            StringBuilder sb = new StringBuilder(text.Length);
+            foreach (char c in text)
+            {
+                char o = c;
+                if (st.ColonFull.HasValue)
+                {
+                    if (st.ColonFull.Value && c == ':') o = '：';
+                    else if (!st.ColonFull.Value && c == '：') o = ':';
+                }
+                if (st.SlashFull.HasValue)
+                {
+                    if (st.SlashFull.Value && c == '/') o = '／';
+                    else if (!st.SlashFull.Value && c == '／') o = '/';
+                }
+                sb.Append(o);
+            }
+            return sb.ToString();
+        }
+
+        /// 选项里的 @跳转 保留目标自己的，其余（颜色等）跟模板
+        private static string MergeOptions(string srcOptions, string dstOptions)
+        {
+            if (srcOptions == null) srcOptions = "";
+            if (dstOptions == null) dstOptions = "";
+            int si = srcOptions.IndexOf("/@");
+            int di = dstOptions.IndexOf("/@");
+            string head = si < 0 ? srcOptions : srcOptions.Substring(0, si);
+            string link = di < 0 ? "" : dstOptions.Substring(di);
+            return head + link;
         }
 
         private static void AddElementPair(ParaPlan plan, ScriptBlock tb, ScriptTag src, ScriptTag dst, bool followAmp)
@@ -1243,8 +1518,17 @@ namespace ScriptCoordOverlay
         public static string BuildNewText(ParaPlan plan)
         {
             List<Edit> edits = new List<Edit>();
+            CollectEdits(plan, edits);
+            return TextEdits.Apply(plan.Doc.Text, edits);
+        }
+
+        /// 把本计划产生的修改收集到 edits（跨脚本模式会把多个计划合并后统一应用）
+        public static void CollectEdits(ParaPlan plan, List<Edit> edits)
+        {
             foreach (ParaPair p in plan.Pairs)
             {
+                if (p.IsMeta) continue;   // 附加变更行只用于预览
+
                 if (p.IsDialog)
                 {
                     if (p.SrcDlg == null || p.DstDlg == null) continue;
@@ -1275,6 +1559,11 @@ namespace ScriptCoordOverlay
                     continue;
                 }
 
+                bool textual = IsTextual(p.Src) && IsTextual(p.Dst);
+                string mergedOptions = plan.SyncColors && textual
+                    ? MergeOptions(p.Src.Options, p.Dst.Options)
+                    : p.Dst.Options;
+
                 if (p.Status == "补全")
                 {
                     if (p.Dst.IsPlain)
@@ -1286,31 +1575,104 @@ namespace ScriptCoordOverlay
                         {
                             Start = p.Dst.RunEnd,
                             Len = 0,
-                            Value = ":" + p.Src.X + ":" + p.Src.Y + p.Src.Options + ">"
+                            Value = ":" + p.Src.X + ":" + p.Src.Y + mergedOptions + ">"
                         });
                     }
                     else
                     {
-                        // <文字/颜色> → <&Text:文字:X:Y/颜色>，保留原文案与选项
+                        // <文字/颜色> → <&Text:文字:X:Y/颜色>，保留原文案
                         string prefix = (p.Src.HasAmp ? "&" : "") + "Text:";
                         edits.Add(new Edit { Start = p.Dst.TagStart + 1, Len = 0, Value = prefix });
-                        int at = p.Dst.OptionsStart >= 0 ? p.Dst.OptionsStart : p.Dst.TagEnd - 1;
+                        bool hasOpt = p.Dst.OptionsStart >= 0;
                         edits.Add(new Edit
                         {
-                            Start = at,
-                            Len = 0,
-                            Value = ":" + p.Src.X + ":" + p.Src.Y
+                            Start = hasOpt ? p.Dst.OptionsStart : p.Dst.TagEnd - 1,
+                            Len = hasOpt ? p.Dst.OptionsLen : 0,
+                            Value = ":" + p.Src.X + ":" + p.Src.Y + mergedOptions
                         });
                     }
-                    continue;
+                }
+                else
+                {
+                    if (p.Src.HasCoord && p.Dst.HasCoord)
+                    {
+                        if (plan.FollowAmp) TextEdits.AddAmpEdits(edits, p.Dst, p.Src.HasAmp);
+                        TextEdits.AddCoordEdits(edits, p.Src, p.Dst);
+                    }
+
+                    if (plan.SyncColors && textual)
+                        AddOptionEdits(edits, p.Dst, mergedOptions);
                 }
 
-                if (!p.Src.HasCoord || !p.Dst.HasCoord) continue;
+                // 标点：文字里的 : / 按模板风格改
+                if (plan.SyncPunctuation && textual && p.Dst.TextStart >= 0)
+                    AddPunctuationEdits(edits, p.Dst, plan.Style);
 
-                if (plan.FollowAmp) TextEdits.AddAmpEdits(edits, p.Dst, p.Src.HasAmp);
-                TextEdits.AddCoordEdits(edits, p.Src, p.Dst);
+                // 图片编号：坐标之前的数字跟模板
+                if (plan.SyncImageIds && p.Src.Kind == ElementKind.Image &&
+                    p.Dst.Kind == ElementKind.Image && p.Dst.TextStart >= 0 &&
+                    p.Src.Text != p.Dst.Text)
+                {
+                    edits.Add(new Edit
+                    {
+                        Start = p.Dst.TextStart,
+                        Len = p.Dst.TextLen,
+                        Value = p.Src.Text
+                    });
+                }
             }
-            return TextEdits.Apply(plan.Doc.Text, edits);
+        }
+
+        private static void AddPunctuationEdits(List<Edit> edits, ScriptTag dst, TextStyle style)
+        {
+            if (style.ColonFull == null && style.SlashFull == null) return;
+            string text = dst.Text ?? "";
+            for (int i = 0; i < text.Length; i++)
+            {
+                char c = text[i];
+                char o = c;
+                if (style.ColonFull.HasValue)
+                {
+                    if (style.ColonFull.Value && c == ':') o = '：';
+                    else if (!style.ColonFull.Value && c == '：') o = ':';
+                }
+                if (style.SlashFull.HasValue)
+                {
+                    if (style.SlashFull.Value && c == '/') o = '／';
+                    else if (!style.SlashFull.Value && c == '／') o = '/';
+                }
+                if (o != c)
+                    edits.Add(new Edit { Start = dst.TextStart + i, Len = 1, Value = o.ToString() });
+            }
+        }
+
+        private static void AddOptionEdits(List<Edit> edits, ScriptTag dst, string merged)
+        {
+            if (merged == dst.Options) return;
+            if (dst.OptionsStart >= 0)
+            {
+                edits.Add(new Edit
+                {
+                    Start = dst.OptionsStart,
+                    Len = dst.OptionsLen,
+                    Value = merged
+                });
+            }
+            else if (merged.Length > 0)
+            {
+                edits.Add(new Edit { Start = dst.TagEnd, Len = 0, Value = merged });
+            }
+        }
+
+        private static ScriptBlock FindBlock(ParaPlan plan, ScriptDoc d2, ScriptBlock target)
+        {
+            if (plan.VerifyByBlock)
+            {
+                if (target.Index < 0 || target.Index >= d2.Blocks.Count) return null;
+                return d2.Blocks[target.Index];
+            }
+            if (target.ParagraphIndex < 0 || target.ParagraphIndex >= d2.Paragraphs.Count) return null;
+            return d2.Paragraphs[target.ParagraphIndex];
         }
 
         public static int Verify(ParaPlan plan, string newText)
@@ -1319,12 +1681,13 @@ namespace ScriptCoordOverlay
             int bad = 0;
             foreach (ParaPair p in plan.Pairs)
             {
+                if (p.IsMeta) continue;
+
                 if (p.IsDialog)
                 {
                     if (p.SrcDlg == null || p.DstDlg == null) continue;
-                    if (p.TargetBlock.ParagraphIndex < 0 ||
-                        p.TargetBlock.ParagraphIndex >= d2.Paragraphs.Count) { bad++; continue; }
-                    ScriptBlock nb = d2.Paragraphs[p.TargetBlock.ParagraphIndex];
+                    ScriptBlock nb = FindBlock(plan, d2, p.TargetBlock);
+                    if (nb == null) { bad++; continue; }
                     if (p.DstDlg.Ordinal >= nb.Dialogs.Count) { bad++; continue; }
                     if (nb.Dialogs[p.DstDlg.Ordinal].Args != p.SrcDlg.Args) bad++;
                     continue;
@@ -1332,11 +1695,14 @@ namespace ScriptCoordOverlay
 
                 if (p.Dst == null || p.Src == null) continue;
 
-                if (p.TargetBlock.ParagraphIndex < 0 ||
-                    p.TargetBlock.ParagraphIndex >= d2.Paragraphs.Count) { bad++; continue; }
-                ScriptBlock nb2 = d2.Paragraphs[p.TargetBlock.ParagraphIndex];
+                ScriptBlock nb2 = FindBlock(plan, d2, p.TargetBlock);
+                if (nb2 == null) { bad++; continue; }
                 if (p.Dst.Ordinal >= nb2.Elements.Count) { bad++; continue; }
                 ScriptTag nt = nb2.Elements[p.Dst.Ordinal];
+
+                bool textual = IsTextual(p.Src) && IsTextual(p.Dst);
+                string expectedText = plan.SyncPunctuation && textual
+                    ? MapPunctuation(p.Dst.Text, plan.Style) : p.Dst.Text;
 
                 if (p.Status == "替换")
                 {
@@ -1348,15 +1714,36 @@ namespace ScriptCoordOverlay
                 if (p.Status == "补全")
                 {
                     if (!nt.HasCoord || nt.X != p.Src.X || nt.Y != p.Src.Y) { bad++; continue; }
-                    if (nt.Text != p.Dst.Text) bad++;
+                    if (nt.Text != expectedText) bad++;
+                    if (plan.SyncColors && textual &&
+                        nt.Options != MergeOptions(p.Src.Options, p.Dst.Options)) bad++;
                     continue;
                 }
 
-                if (!p.Src.HasCoord || !p.Dst.HasCoord) continue;
-                if (nt.X != p.Src.X || nt.Y != p.Src.Y) { bad++; continue; }
-                if (plan.FollowAmp && nt.HasAmp != p.Src.HasAmp) bad++;
+                if (p.Src.HasCoord && p.Dst.HasCoord)
+                {
+                    if (nt.X != p.Src.X || nt.Y != p.Src.Y) { bad++; continue; }
+                    if (plan.FollowAmp && nt.HasAmp != p.Src.HasAmp) { bad++; continue; }
+                }
+
+                if (plan.SyncPunctuation && textual && nt.Text != expectedText) bad++;
+
+                if (plan.SyncImageIds && p.Src.Kind == ElementKind.Image &&
+                    p.Dst.Kind == ElementKind.Image && nt.Text != p.Src.Text) bad++;
+
+                if (plan.SyncColors && textual &&
+                    nt.Options != MergeOptions(p.Src.Options, p.Dst.Options)) bad++;
             }
             return bad;
+        }
+
+        private static string StyleDescription(TextStyle st)
+        {
+            List<string> parts = new List<string>();
+            if (st.ColonFull.HasValue) parts.Add(st.ColonFull.Value ? "冒号全角" : "冒号半角");
+            if (st.SlashFull.HasValue) parts.Add(st.SlashFull.Value ? "斜杠全角" : "斜杠半角");
+            if (parts.Count == 0) return "模板没有可参照的标点，不修改";
+            return string.Join(" / ", parts.ToArray());
         }
 
         public static string BuildReport(ParaPlan plan, bool applied)
@@ -1369,9 +1756,15 @@ namespace ScriptCoordOverlay
                           + (plan.SkippedBlocks > 0 ? "（其中 " + plan.SkippedBlocks + " 段因结构不同被跳过）" : ""));
             sb.AppendLine("坐标写法    ：" + (plan.FollowAmp ? "跟随模板（& = 绝对坐标）" : "仅复制数字"));
             sb.AppendLine("对话框参数  ：" + (plan.SyncDialog ? "同步（OPENMERCHANTBIGDLG 与模板一致）" : "不同步"));
+            sb.AppendLine("内容标点    ：" + (plan.SyncPunctuation ? StyleDescription(plan.Style) : "不同步"));
+            sb.AppendLine("图片编号    ：" + (plan.SyncImageIds ? "同步" : "不同步"));
+            sb.AppendLine("颜色/选项   ：" + (plan.SyncColors ? "同步" : "不同步"));
             sb.AppendLine("状态        ：" + (applied ? "已写入" : "仅预览"));
-            sb.AppendLine(string.Format("匹配 {0} 处：需覆盖 {1}（其中简写补全 {2}），已一致 {3}，缺失 {4}",
-                plan.Pairs.Count, plan.ChangeCount, plan.CompleteCount, plan.SameCount, plan.MissingCount));
+            sb.AppendLine(string.Format(
+                "匹配 {0} 处：需覆盖 {1}（简写补全 {2}），标点 {3}，编号 {4}，颜色 {5}，已一致 {6}，缺失 {7}",
+                plan.Pairs.Count, plan.ChangeCount, plan.CompleteCount,
+                plan.PunctChanges, plan.IdChanges, plan.ColorChanges,
+                plan.SameCount, plan.MissingCount));
             if (plan.Warnings.Count > 0)
             {
                 sb.AppendLine("提示：");
@@ -1381,6 +1774,17 @@ namespace ScriptCoordOverlay
             sb.AppendLine("目标段落\t序号\t文本\t模板坐标\t原坐标\t写法\t状态");
             foreach (ParaPair p in plan.Pairs)
             {
+                if (p.IsMeta)
+                {
+                    string oldv = p.MetaOld.Length == 0 ? "无" : p.MetaOld;
+                    string newv = p.MetaNew.Length == 0 ? "无" : p.MetaNew;
+                    sb.AppendLine(string.Format("{0}\t-\t{1}\t-\t-\t-\t{2}",
+                        p.TargetBlock.Name,
+                        (oldv + " → " + newv).Replace("\t", " "),
+                        p.Status));
+                    continue;
+                }
+
                 if (p.IsDialog)
                 {
                     string s = p.SrcDlg != null ? p.SrcDlg.Args : "-";
@@ -1418,6 +1822,7 @@ namespace ScriptCoordOverlay
             string src = null, report = null, template = null;
             bool apply = false;
             bool noDialog = false;
+            bool syncPunct = true, syncIds = true, syncColors = false;
             bool para = args.Length > 0 && args[0] == "--cli-para";
             List<string> dsts = new List<string>();
             List<string> files = new List<string>();
@@ -1427,6 +1832,9 @@ namespace ScriptCoordOverlay
                 string a = args[i];
                 if (a == "--apply") { apply = true; continue; }
                 if (a == "--no-dialog") { noDialog = true; continue; }
+                if (a == "--no-punct") { syncPunct = false; continue; }
+                if (a == "--no-ids") { syncIds = false; continue; }
+                if (a == "--sync-colors") { syncColors = true; continue; }
                 if (i + 1 < args.Length)
                 {
                     if (a == "--src") { src = args[++i]; continue; }
@@ -1441,8 +1849,9 @@ namespace ScriptCoordOverlay
             int code;
             try
             {
-                code = para ? RunParaBatch(files, template, apply, noDialog, outBuf)
-                            : RunCrossBatch(src, dsts, apply, outBuf);
+                code = para
+                    ? RunParaBatch(files, template, apply, noDialog, syncPunct, syncIds, syncColors, outBuf)
+                    : RunCrossBatch(src, dsts, apply, syncPunct, syncIds, syncColors, outBuf);
             }
             catch (Exception ex)
             {
@@ -1467,7 +1876,9 @@ namespace ScriptCoordOverlay
 
         // ---------------- 跨脚本 ----------------
 
-        private static int RunCrossBatch(string src, List<string> dsts, bool apply, StringBuilder outBuf)
+        private static int RunCrossBatch(string src, List<string> dsts, bool apply,
+                                        bool syncPunct, bool syncIds, bool syncColors,
+                                        StringBuilder outBuf)
         {
             if (src == null || dsts.Count == 0)
             {
@@ -1478,7 +1889,7 @@ namespace ScriptCoordOverlay
             if (dsts.Count == 1)
             {
                 string only;
-                return RunCrossOne(src, dsts[0], apply, outBuf, true, out only);
+                return RunCrossOne(src, dsts[0], apply, outBuf, true, syncPunct, syncIds, syncColors, out only);
             }
 
             outBuf.AppendLine(string.Format("批量跨脚本覆盖：源 {0}，目标 {1} 个文件", src, dsts.Count));
@@ -1490,7 +1901,7 @@ namespace ScriptCoordOverlay
                 outBuf.AppendLine(string.Format("[{0}/{1}] {2}", i + 1, dsts.Count, dsts[i]));
                 StringBuilder one = new StringBuilder();
                 string state;
-                int c = RunCrossOne(src, dsts[i], apply, one, false, out state);
+                int c = RunCrossOne(src, dsts[i], apply, one, false, syncPunct, syncIds, syncColors, out state);
                 outBuf.Append(one);
                 if (state == "写入") written++;
                 else if (state == "已一致") same++;
@@ -1512,10 +1923,11 @@ namespace ScriptCoordOverlay
         }
 
         private static int RunCrossOne(string src, string dst, bool apply, StringBuilder outBuf,
-                                       bool fullReport, out string state)
+                                       bool fullReport, bool syncPunct, bool syncIds, bool syncColors,
+                                       out string state)
         {
             state = "失败";
-            ScanResult r = OverlayEngine.Scan(src, dst);
+            ScanResult r = OverlayEngine.Scan(src, dst, syncPunct, syncIds, syncColors);
             outBuf.AppendLine(string.Format("源标签 {0}，目标标签 {1}，需覆盖 {2}，已一致 {3}，缺失 {4}",
                 r.TagA, r.TagB, r.ChangeCount, r.SameCount, r.MissingCount));
             foreach (string w in r.Warnings) outBuf.AppendLine("提示：" + w);
@@ -1530,7 +1942,7 @@ namespace ScriptCoordOverlay
 
             if (!apply)
             {
-                state = r.ChangeCount == 0 ? "已一致" : "可覆盖";
+                state = r.TotalChanges == 0 ? "已一致" : "可覆盖";
                 outBuf.AppendLine(state == "已一致" ? "坐标已经一致。" : "可覆盖。");
                 if (fullReport) outBuf.Append(OverlayEngine.BuildReport(r, false));
                 return 0;
@@ -1558,7 +1970,9 @@ namespace ScriptCoordOverlay
 
         // ---------------- 同脚本段落 ----------------
 
-        private static int RunParaBatch(List<string> files, string template, bool apply, bool noDialog, StringBuilder outBuf)
+        private static int RunParaBatch(List<string> files, string template, bool apply, bool noDialog,
+                                        bool syncPunct, bool syncIds, bool syncColors,
+                                        StringBuilder outBuf)
         {
             if (files.Count == 0)
             {
@@ -1569,7 +1983,7 @@ namespace ScriptCoordOverlay
             if (files.Count == 1)
             {
                 string only;
-                return RunParaOne(files[0], template, apply, outBuf, true, noDialog, out only);
+                return RunParaOne(files[0], template, apply, outBuf, true, noDialog, syncPunct, syncIds, syncColors, out only);
             }
 
             outBuf.AppendLine(string.Format(
@@ -1582,7 +1996,7 @@ namespace ScriptCoordOverlay
                 outBuf.AppendLine(string.Format("[{0}/{1}] {2}", i + 1, files.Count, files[i]));
                 StringBuilder one = new StringBuilder();
                 string state;
-                int c = RunParaOne(files[i], template, apply, one, false, noDialog, out state);
+                int c = RunParaOne(files[i], template, apply, one, false, noDialog, syncPunct, syncIds, syncColors, out state);
                 outBuf.Append(one);
                 if (state == "写入") written++;
                 else if (state == "已一致") same++;
@@ -1604,7 +2018,8 @@ namespace ScriptCoordOverlay
         }
 
         private static int RunParaOne(string file, string template, bool apply, StringBuilder outBuf,
-                                      bool fullReport, bool noDialog, out string state)
+                                      bool fullReport, bool noDialog,
+                                      bool syncPunct, bool syncIds, bool syncColors, out string state)
         {
             state = "失败";
             ScriptDoc doc = ScriptParser.Load(file);
@@ -1636,7 +2051,7 @@ namespace ScriptCoordOverlay
             List<ScriptBlock> targets = new List<ScriptBlock>();
             foreach (ScriptBlock b in group.Blocks) if (b != tpl) targets.Add(b);
 
-            ParaPlan plan = TemplateEngine.BuildPlan(doc, tpl, targets, true, !noDialog);
+            ParaPlan plan = TemplateEngine.BuildPlan(doc, tpl, targets, true, !noDialog, syncPunct, syncIds, syncColors);
             outBuf.AppendLine(string.Format("组内 {0} 段，模板 {1}，目标 {2} 段；需覆盖 {3}，已一致 {4}，跳过 {5}",
                 group.Blocks.Count, tpl.Name, targets.Count,
                 plan.ChangeCount, plan.SameCount, plan.SkippedBlocks));
@@ -1644,13 +2059,13 @@ namespace ScriptCoordOverlay
 
             if (!apply)
             {
-                state = plan.ChangeCount == 0 ? "已一致" : "可覆盖";
+                state = plan.TotalChanges == 0 ? "已一致" : "可覆盖";
                 outBuf.AppendLine(state == "已一致" ? "坐标已经一致。" : "可覆盖。");
                 if (fullReport) outBuf.Append(TemplateEngine.BuildReport(plan, false));
                 return 0;
             }
 
-            if (plan.ChangeCount == 0)
+            if (plan.TotalChanges == 0)
             {
                 outBuf.AppendLine("坐标已经一致，无需写入。");
                 state = "已一致";
@@ -1698,6 +2113,9 @@ namespace ScriptCoordOverlay
         private CheckBox _chkBackup;
         private CheckBox _chkAmp;
         private CheckBox _chkDialog;
+        private CheckBox _chkPunct;
+        private CheckBox _chkIds;
+        private CheckBox _chkColors;
         private readonly List<BatchItem> _rows = new List<BatchItem>();
 
         public BatchForm(bool cross, string source, string currentFile)
@@ -1729,7 +2147,7 @@ namespace ScriptCoordOverlay
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, _cross ? 44F : 32F));
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 150F));
             root.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
-            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 88F));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 114F));
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 96F));
             Controls.Add(root);
 
@@ -1839,11 +2257,12 @@ namespace ScriptCoordOverlay
             TableLayoutPanel actionBar = new TableLayoutPanel();
             actionBar.Dock = DockStyle.Fill;
             actionBar.ColumnCount = 2;
-            actionBar.RowCount = 2;
+            actionBar.RowCount = 3;
             actionBar.Padding = new Padding(12, 4, 12, 4);
             actionBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
             actionBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 430F));
             actionBar.RowStyles.Add(new RowStyle(SizeType.Absolute, 34F));
+            actionBar.RowStyles.Add(new RowStyle(SizeType.Absolute, 26F));
             actionBar.RowStyles.Add(new RowStyle(SizeType.Absolute, 26F));
             root.Controls.Add(actionBar, 0, 3);
 
@@ -1907,6 +2326,35 @@ namespace ScriptCoordOverlay
                 _chkDialog.Margin = new Padding(24, 0, 0, 0);
                 options.Controls.Add(_chkDialog);
             }
+
+            FlowLayoutPanel options2 = new FlowLayoutPanel();
+            options2.Dock = DockStyle.Fill;
+            options2.FlowDirection = FlowDirection.LeftToRight;
+            options2.WrapContents = false;
+            options2.Margin = new Padding(0);
+            actionBar.Controls.Add(options2, 0, 2);
+            actionBar.SetColumnSpan(options2, 2);
+
+            _chkPunct = new CheckBox();
+            _chkPunct.Text = "同步标点风格（冒号、斜杠）";
+            _chkPunct.AutoSize = true;
+            _chkPunct.Checked = true;
+            _chkPunct.Margin = new Padding(0);
+            options2.Controls.Add(_chkPunct);
+
+            _chkIds = new CheckBox();
+            _chkIds.Text = "同步图片编号";
+            _chkIds.AutoSize = true;
+            _chkIds.Checked = true;
+            _chkIds.Margin = new Padding(24, 0, 0, 0);
+            options2.Controls.Add(_chkIds);
+
+            _chkColors = new CheckBox();
+            _chkColors.Text = "同步颜色/选项";
+            _chkColors.AutoSize = true;
+            _chkColors.Checked = false;
+            _chkColors.Margin = new Padding(24, 0, 0, 0);
+            options2.Controls.Add(_chkColors);
 
             _log = new TextBox();
             _log.Multiline = true;
@@ -2056,7 +2504,7 @@ namespace ScriptCoordOverlay
                         return it;
                     }
 
-                    ScanResult s = OverlayEngine.Scan(_tbSrc.Text, path);
+                    ScanResult s = OverlayEngine.Scan(_tbSrc.Text, path, _chkPunct.Checked, _chkIds.Checked, _chkColors.Checked);
                     it.CrossPlan = s;
                     it.Scale = "标签 " + s.TagB;
                     it.Changes = s.ChangeCount;
@@ -2066,7 +2514,7 @@ namespace ScriptCoordOverlay
                     it.Warnings = s.Warnings;
 
                     if (!s.StructureOk) it.Result = "跳过：结构不一致";
-                    else if (s.ChangeCount == 0) it.Result = "已一致";
+                    else if (s.TotalChanges == 0) it.Result = "已一致";
                     else it.Result = "可覆盖";
                 }
                 else
@@ -2087,7 +2535,7 @@ namespace ScriptCoordOverlay
                     List<ScriptBlock> targets = new List<ScriptBlock>();
                     for (int i = 1; i < g.Blocks.Count; i++) targets.Add(g.Blocks[i]);
 
-                    ParaPlan plan = TemplateEngine.BuildPlan(doc, g.Blocks[0], targets, true, _chkDialog.Checked);
+                    ParaPlan plan = TemplateEngine.BuildPlan(doc, g.Blocks[0], targets, true, _chkDialog.Checked, _chkPunct.Checked, _chkIds.Checked, _chkColors.Checked);
                     it.ParaPlan = plan;
                     it.Scale = "段落 " + g.Blocks.Count;
                     it.Changes = plan.ChangeCount;
@@ -2096,7 +2544,7 @@ namespace ScriptCoordOverlay
                     it.Structure = plan.SkippedBlocks > 0 ? "部分不同" : "同构";
                     it.Warnings = plan.Warnings;
 
-                    if (plan.ChangeCount == 0) it.Result = "已一致";
+                    if (plan.TotalChanges == 0) it.Result = "已一致";
                     else it.Result = "可覆盖";
                 }
             }
@@ -2322,6 +2770,9 @@ namespace ScriptCoordOverlay
         private Label _lblSummary;
         private CheckBox _chkLax;
         private CheckBox _chkBackup;
+        private CheckBox _cChkPunct;
+        private CheckBox _cChkIds;
+        private CheckBox _cChkColors;
         private Button _btnScan;
         private Button _btnApply;
         private ScanResult _result;
@@ -2338,6 +2789,9 @@ namespace ScriptCoordOverlay
         private Label _pSummary;
         private CheckBox _pChkAmp;
         private CheckBox _pChkDialog;
+        private CheckBox _pChkPunct;
+        private CheckBox _pChkIds;
+        private CheckBox _pChkColors;
         private CheckBox _pBackup;
         private ScriptDoc _pDoc;
         private List<ParagraphGroup> _pGroups = new List<ParagraphGroup>();
@@ -2368,7 +2822,7 @@ namespace ScriptCoordOverlay
 
         private void BuildUi()
         {
-            Text = "脚本坐标精准覆盖 · 插件";
+            Text = "传奇脚本同步器";
             StartPosition = FormStartPosition.CenterScreen;
             ClientSize = new Size(1060, 760);
             MinimumSize = new Size(1000, 620);
@@ -2459,7 +2913,7 @@ namespace ScriptCoordOverlay
             root.RowCount = 4;
             root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 92F));
-            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 76F));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 102F));
             root.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 104F));
 
@@ -2510,11 +2964,12 @@ namespace ScriptCoordOverlay
             TableLayoutPanel actionBar = new TableLayoutPanel();
             actionBar.Dock = DockStyle.Fill;
             actionBar.ColumnCount = 2;
-            actionBar.RowCount = 2;
+            actionBar.RowCount = 3;
             actionBar.Padding = new Padding(12, 5, 12, 5);
             actionBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
             actionBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 380F));
             actionBar.RowStyles.Add(new RowStyle(SizeType.Absolute, 34F));
+            actionBar.RowStyles.Add(new RowStyle(SizeType.Absolute, 26F));
             actionBar.RowStyles.Add(new RowStyle(SizeType.Absolute, 26F));
             root.Controls.Add(actionBar, 0, 1);
 
@@ -2577,6 +3032,35 @@ namespace ScriptCoordOverlay
             _chkBackup.Margin = new Padding(24, 0, 0, 0);
             options.Controls.Add(_chkBackup);
 
+            FlowLayoutPanel options2 = new FlowLayoutPanel();
+            options2.Dock = DockStyle.Fill;
+            options2.FlowDirection = FlowDirection.LeftToRight;
+            options2.WrapContents = false;
+            options2.Margin = new Padding(0);
+            actionBar.Controls.Add(options2, 0, 2);
+            actionBar.SetColumnSpan(options2, 2);
+
+            _cChkPunct = new CheckBox();
+            _cChkPunct.Text = "同步标点风格（冒号、斜杠）";
+            _cChkPunct.AutoSize = true;
+            _cChkPunct.Checked = true;
+            _cChkPunct.Margin = new Padding(0);
+            options2.Controls.Add(_cChkPunct);
+
+            _cChkIds = new CheckBox();
+            _cChkIds.Text = "同步图片编号";
+            _cChkIds.AutoSize = true;
+            _cChkIds.Checked = true;
+            _cChkIds.Margin = new Padding(24, 0, 0, 0);
+            options2.Controls.Add(_cChkIds);
+
+            _cChkColors = new CheckBox();
+            _cChkColors.Text = "同步颜色/选项";
+            _cChkColors.AutoSize = true;
+            _cChkColors.Checked = false;
+            _cChkColors.Margin = new Padding(24, 0, 0, 0);
+            options2.Controls.Add(_cChkColors);
+
             _grid = new DataGridView();
             StyleGrid(_grid);
             _grid.Margin = new Padding(12, 0, 12, 0);
@@ -2636,10 +3120,10 @@ namespace ScriptCoordOverlay
             root.ColumnCount = 1;
             root.RowCount = 5;
             root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
-            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 46F));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 58F));
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 44F));
             root.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
-            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 74F));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 100F));
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 92F));
 
             // 文件行
@@ -2647,7 +3131,7 @@ namespace ScriptCoordOverlay
             fileRow.Dock = DockStyle.Fill;
             fileRow.ColumnCount = 3;
             fileRow.RowCount = 1;
-            fileRow.Padding = new Padding(12, 8, 12, 2);
+            fileRow.Padding = new Padding(12, 8, 12, 4);
             fileRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 84F));
             fileRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
             fileRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 92F));
@@ -2658,7 +3142,7 @@ namespace ScriptCoordOverlay
 
             _pFile = new TextBox();
             _pFile.Dock = DockStyle.Fill;
-            _pFile.Margin = new Padding(0, 7, 8, 7);
+            _pFile.Margin = new Padding(0, 8, 8, 8);
             _pFile.AllowDrop = true;
             _pFile.DragEnter += OnDragEnter;
             _pFile.DragDrop += OnDropParaFile;
@@ -2666,7 +3150,7 @@ namespace ScriptCoordOverlay
             fileRow.Controls.Add(_pFile, 1, 0);
 
             Button btnFile = MakeBrowseButton();
-            btnFile.Margin = new Padding(0, 6, 0, 6);
+            btnFile.Margin = new Padding(0, 7, 0, 7);
             btnFile.Click += OnPickPFile;
             fileRow.Controls.Add(btnFile, 2, 0);
 
@@ -2751,11 +3235,12 @@ namespace ScriptCoordOverlay
             TableLayoutPanel actionBar = new TableLayoutPanel();
             actionBar.Dock = DockStyle.Fill;
             actionBar.ColumnCount = 2;
-            actionBar.RowCount = 2;
+            actionBar.RowCount = 3;
             actionBar.Padding = new Padding(12, 4, 12, 4);
             actionBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
             actionBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 400F));
             actionBar.RowStyles.Add(new RowStyle(SizeType.Absolute, 34F));
+            actionBar.RowStyles.Add(new RowStyle(SizeType.Absolute, 26F));
             actionBar.RowStyles.Add(new RowStyle(SizeType.Absolute, 26F));
             root.Controls.Add(actionBar, 0, 3);
 
@@ -2828,6 +3313,35 @@ namespace ScriptCoordOverlay
             _pBackup.Checked = true;
             _pBackup.Margin = new Padding(24, 0, 0, 0);
             options.Controls.Add(_pBackup);
+
+            FlowLayoutPanel options2 = new FlowLayoutPanel();
+            options2.Dock = DockStyle.Fill;
+            options2.FlowDirection = FlowDirection.LeftToRight;
+            options2.WrapContents = false;
+            options2.Margin = new Padding(0);
+            actionBar.Controls.Add(options2, 0, 2);
+            actionBar.SetColumnSpan(options2, 2);
+
+            _pChkPunct = new CheckBox();
+            _pChkPunct.Text = "同步标点风格（冒号、斜杠）";
+            _pChkPunct.AutoSize = true;
+            _pChkPunct.Checked = true;
+            _pChkPunct.Margin = new Padding(0);
+            options2.Controls.Add(_pChkPunct);
+
+            _pChkIds = new CheckBox();
+            _pChkIds.Text = "同步图片编号";
+            _pChkIds.AutoSize = true;
+            _pChkIds.Checked = true;
+            _pChkIds.Margin = new Padding(24, 0, 0, 0);
+            options2.Controls.Add(_pChkIds);
+
+            _pChkColors = new CheckBox();
+            _pChkColors.Text = "同步颜色/选项";
+            _pChkColors.AutoSize = true;
+            _pChkColors.Checked = false;
+            _pChkColors.Margin = new Padding(24, 0, 0, 0);
+            options2.Controls.Add(_pChkColors);
 
             _pLog = MakeLog();
             _pLog.Margin = new Padding(12, 6, 12, 10);
@@ -2945,7 +3459,7 @@ namespace ScriptCoordOverlay
             try
             {
                 Cursor = Cursors.WaitCursor;
-                _result = OverlayEngine.Scan(_tbSrc.Text, _tbDst.Text);
+                _result = OverlayEngine.Scan(_tbSrc.Text, _tbDst.Text, _cChkPunct.Checked, _cChkIds.Checked, _cChkColors.Checked);
                 _scannedSrc = _tbSrc.Text;
                 _scannedDst = _tbDst.Text;
                 FillGrid(_result);
@@ -2972,6 +3486,30 @@ namespace ScriptCoordOverlay
             _grid.Rows.Clear();
             foreach (CoordPair p in r.Pairs)
             {
+                if (p.IsMeta)
+                {
+                    string detail = p.Status == "颜色"
+                        ? (p.MetaOld.Length == 0 ? "无" : p.MetaOld) + " → " + (p.MetaNew.Length == 0 ? "无" : p.MetaNew)
+                        : Shorten(p.MetaOld, 30) + " → " + Shorten(p.MetaNew, 30);
+                    int mi = _grid.Rows.Add(p.Index, p.BlockName, "—", detail, "—", "—", "—", p.Status);
+                    _grid.Rows[mi].DefaultCellStyle.BackColor = Color.FromArgb(228, 240, 255);
+                    _grid.Rows[mi].Cells[3].ToolTipText = p.MetaOld + "  →  " + p.MetaNew;
+                    continue;
+                }
+
+                if (p.IsDialog)
+                {
+                    string sa = p.SrcDlg != null ? p.SrcDlg.Args : "—";
+                    string da = p.DstDlg != null ? p.DstDlg.Args : "—";
+                    int di = _grid.Rows.Add(p.Index, p.BlockName, "框", "OPENMERCHANTBIGDLG", sa, da, "—", p.Status);
+                    DataGridViewRow drow = _grid.Rows[di];
+                    if (p.Status == "覆盖") drow.DefaultCellStyle.BackColor = Color.FromArgb(255, 248, 214);
+                    else drow.DefaultCellStyle.ForeColor = Color.FromArgb(110, 110, 110);
+                    drow.Cells[4].ToolTipText = sa;
+                    drow.Cells[5].ToolTipText = da;
+                    continue;
+                }
+
                 string text = p.Src != null ? Shorten(p.Src.Text, 60) : "";
                 string sx = p.Src != null && p.Src.HasCoord ? p.Src.X + " : " + p.Src.Y : "—";
                 string dx = p.Dst != null && p.Dst.HasCoord ? p.Dst.X + " : " + p.Dst.Y : "—";
@@ -2981,8 +3519,10 @@ namespace ScriptCoordOverlay
                 int idx = _grid.Rows.Add(p.Index, p.BlockName, line, text, sx, dx, amp, p.Status);
 
                 DataGridViewRow row = _grid.Rows[idx];
-                if (p.Status == "覆盖") row.DefaultCellStyle.BackColor = Color.FromArgb(255, 248, 214);
+                if (p.Status == "覆盖" || p.Status == "补全" || p.Status == "替换")
+                    row.DefaultCellStyle.BackColor = Color.FromArgb(255, 248, 214);
                 else if (p.Status == "缺失") row.DefaultCellStyle.BackColor = Color.FromArgb(255, 228, 228);
+                else if (p.Status == "种类不同") row.DefaultCellStyle.BackColor = Color.FromArgb(255, 226, 196);
                 else row.DefaultCellStyle.ForeColor = Color.FromArgb(110, 110, 110);
 
                 row.Cells[3].ToolTipText = p.Src != null ? p.Src.Raw : "";
@@ -2991,8 +3531,12 @@ namespace ScriptCoordOverlay
             _grid.ClearSelection();
             _grid.ResumeLayout();
 
-            _lblSummary.Text = string.Format("共 {0} 处 · 覆盖 {1} · 一致 {2} · 缺失 {3}",
-                r.Pairs.Count, r.ChangeCount, r.SameCount, r.MissingCount);
+            string punctNote = r.PunctChanges > 0 ? " · 标点 " + r.PunctChanges : "";
+            string idNote = r.IdChanges > 0 ? " · 编号 " + r.IdChanges : "";
+            string colorNote = r.ColorChanges > 0 ? " · 颜色 " + r.ColorChanges : "";
+            _lblSummary.Text = string.Format("共 {0} 行 · 覆盖 {1} · 一致 {2} · 缺失 {3}{4}{5}{6}",
+                r.Pairs.Count, r.ChangeCount, r.SameCount, r.MissingCount,
+                punctNote, idNote, colorNote);
             _lblSummary.ForeColor = r.MissingCount > 0 || !r.StructureOk
                 ? Color.FromArgb(190, 40, 40) : Color.FromArgb(60, 60, 60);
         }
@@ -3014,7 +3558,7 @@ namespace ScriptCoordOverlay
                 return;
             }
 
-            if (_result.ChangeCount == 0)
+            if (_result.TotalChanges == 0)
             {
                 MessageBox.Show(this, "所有坐标已经一致，无需覆盖。", "提示",
                     MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -3283,7 +3827,7 @@ namespace ScriptCoordOverlay
 
             List<ScriptBlock> targets = SelectedParaBlocks();
             if (targets.Count == 0) return null;
-            return TemplateEngine.BuildPlan(_pDoc, g.Blocks[ti], targets, _pChkAmp.Checked, _pChkDialog.Checked);
+            return TemplateEngine.BuildPlan(_pDoc, g.Blocks[ti], targets, _pChkAmp.Checked, _pChkDialog.Checked, _pChkPunct.Checked, _pChkIds.Checked, _pChkColors.Checked);
         }
 
         private void OnParaScan(object sender, EventArgs e)
@@ -3319,6 +3863,18 @@ namespace ScriptCoordOverlay
             _pGrid.Rows.Clear();
             foreach (ParaPair p in plan.Pairs)
             {
+                if (p.IsMeta)
+                {
+                    string detail = p.Status == "颜色"
+                        ? (p.MetaOld.Length == 0 ? "无" : p.MetaOld) + " → " + (p.MetaNew.Length == 0 ? "无" : p.MetaNew)
+                        : Shorten(p.MetaOld, 28) + " → " + Shorten(p.MetaNew, 28);
+                    int mi = _pGrid.Rows.Add(p.TargetBlock.Name, "—", detail, "—", "—", "—", p.Status);
+                    DataGridViewRow mrow = _pGrid.Rows[mi];
+                    mrow.DefaultCellStyle.BackColor = Color.FromArgb(228, 240, 255);
+                    mrow.Cells[2].ToolTipText = p.MetaOld + "  →  " + p.MetaNew;
+                    continue;
+                }
+
                 if (p.IsDialog)
                 {
                     string sa = p.SrcDlg != null ? p.SrcDlg.Args : "—";
@@ -3365,8 +3921,12 @@ namespace ScriptCoordOverlay
             string dialogNote = plan.DialogChanges > 0 ? " · 对话框 " + plan.DialogChanges : "";
             string completeNote = plan.CompleteCount > 0 ? " · 补全 " + plan.CompleteCount : "";
             string buttonNote = plan.ButtonChanges > 0 ? " · 按钮 " + plan.ButtonChanges : "";
-            _pSummary.Text = string.Format("覆盖 {0} · 一致 {1}{2}{3}{4}",
-                plan.ChangeCount, plan.SameCount, dialogNote, completeNote, buttonNote);
+            string punctNote = plan.PunctChanges > 0 ? " · 标点 " + plan.PunctChanges : "";
+            string idNote = plan.IdChanges > 0 ? " · 编号 " + plan.IdChanges : "";
+            string colorNote = plan.ColorChanges > 0 ? " · 颜色 " + plan.ColorChanges : "";
+            _pSummary.Text = string.Format("覆盖 {0} · 一致 {1}{2}{3}{4}{5}{6}{7}",
+                plan.ChangeCount, plan.SameCount, dialogNote, completeNote, buttonNote,
+                punctNote, idNote, colorNote);
             _pSummary.ForeColor = plan.MissingCount > 0
                 ? Color.FromArgb(190, 40, 40) : Color.FromArgb(60, 60, 60);
         }
@@ -3392,7 +3952,7 @@ namespace ScriptCoordOverlay
                     "结构提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
 
-            if (plan.ChangeCount == 0)
+            if (plan.TotalChanges == 0)
             {
                 MessageBox.Show(this, "所选段落的坐标已经与模板一致，无需覆盖。", "提示",
                     MessageBoxButtons.OK, MessageBoxIcon.Information);

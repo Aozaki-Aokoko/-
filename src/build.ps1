@@ -12,8 +12,12 @@ if (-not (Test-Path $csc)) {
 }
 
 $root = Split-Path -Parent $PSScriptRoot
-$out = Join-Path $root 'dist\坐标覆盖插件.exe'
+$out = Join-Path $root 'dist\传奇脚本同步器.exe'
 New-Item -ItemType Directory -Force (Split-Path $out) | Out-Null
+
+# 旧文件名，升级时顺手清掉
+$legacy = Join-Path $root 'dist\坐标覆盖插件.exe'
+if (Test-Path $legacy) { Remove-Item $legacy -Force -ErrorAction SilentlyContinue }
 
 & $csc /nologo /target:winexe /platform:anycpu /optimize+ /codepage:65001 `
     "/win32manifest:$PSScriptRoot\app.manifest" `
