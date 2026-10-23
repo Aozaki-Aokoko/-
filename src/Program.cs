@@ -372,7 +372,7 @@ namespace ScriptCoordOverlay
                         if (cur != null) cur.IfLines.Add(li + 1);
                         inSay = false;
                     }
-                    else if (head == "say")
+                    else if (head == "say" || head == "elsesay")
                     {
                         inSay = true;
                     }
@@ -498,6 +498,8 @@ namespace ScriptCoordOverlay
 
             string content = line.Substring(a, b - a);
             if (content.StartsWith("<$")) return;   // 变量片段不当作可补全文字
+            if (content.IndexOf('<') >= 0 || content.IndexOf('>') >= 0)
+                return;                              // 残缺标签（例如漏了 '<'）不要动
 
             ScriptTag p = new ScriptTag();
             p.IsPlain = true;
@@ -799,8 +801,43 @@ namespace ScriptCoordOverlay
             }
 
             List<ParagraphGroup> res = new List<ParagraphGroup>();
+
+            // 近似归组：只差一两个控件、文字高度相似的组直接合并
+            bool merged = true;
+            while (merged)
+            {
+                merged = false;
+                for (int i = 0; i < ordered.Count; i++)
+                {
+                    if (ordered[i].Blocks.Count == 0) continue;
+                    for (int j = i + 1; j < ordered.Count; j++)
+                    {
+                        if (ordered[j].Blocks.Count == 0) continue;
+                        ScriptBlock a = ordered[i].Blocks[0];
+                        ScriptBlock b = ordered[j].Blocks[0];
+                        if (Math.Abs(a.Elements.Count - b.Elements.Count) > 2) continue;
+                        if (FuzzyScore(a, b) < 0.55) continue;
+
+                        ordered[i].Blocks.AddRange(ordered[j].Blocks);
+                        ordered[j].Blocks.Clear();
+                        merged = true;
+                    }
+                }
+            }
+
             foreach (ParagraphGroup g in ordered)
-                if (g.Blocks.Count >= 2) res.Add(g);
+            {
+                if (g.Blocks.Count < 2) continue;
+
+                // 组内按文档顺序排，第一段就是默认模板
+                g.Blocks.Sort(delegate(ScriptBlock a, ScriptBlock b)
+                {
+                    if (a.SourceBlockIndex != b.SourceBlockIndex)
+                        return a.SourceBlockIndex.CompareTo(b.SourceBlockIndex);
+                    return a.StartLine.CompareTo(b.StartLine);
+                });
+                res.Add(g);
+            }
             return res;
         }
 
@@ -850,22 +887,32 @@ namespace ScriptCoordOverlay
 
             foreach (ScriptBlock tb in targets)
             {
-                // 结构不同（控件数或分行数不同）的段落不去动它
-                if (tb.Elements.Count != template.Elements.Count ||
-                    LineCounts(tb) != LineCounts(template))
+                bool exact = tb.Elements.Count == template.Elements.Count &&
+                             LineCounts(tb) == LineCounts(template);
+                List<List<ScriptTag>> tplLines = null;
+                List<List<ScriptTag>> dstLines = null;
+
+                if (!exact)
                 {
-                    plan.SkippedBlocks++;
-                    plan.Warnings.Add(string.Format(
-                        "段落「{0}」与模板结构不同（模板 {1} 个控件 / 本段 {2} 个），已跳过。",
-                        tb.Name, template.Elements.Count, tb.Elements.Count));
-                    ParaPair bad = new ParaPair();
-                    bad.TargetBlock = tb;
-                    bad.Src = template.Elements.Count > 0 ? template.Elements[0] : null;
-                    bad.Dst = null;
-                    bad.Status = "结构异常";
-                    plan.Pairs.Add(bad);
-                    plan.MissingCount++;
-                    continue;
+                    // 控件数只差一两个时，按行 + 文字相似度对齐（逗号写进标签里之类）
+                    tplLines = LineGroups(template);
+                    dstLines = LineGroups(tb);
+                    if (tplLines.Count == 0 || tplLines.Count != dstLines.Count ||
+                        Math.Abs(tb.Elements.Count - template.Elements.Count) > 2)
+                    {
+                        plan.SkippedBlocks++;
+                        plan.Warnings.Add(string.Format(
+                            "段落「{0}」与模板结构不同（模板 {1} 个控件 / 本段 {2} 个），已跳过。",
+                            tb.Name, template.Elements.Count, tb.Elements.Count));
+                        ParaPair bad = new ParaPair();
+                        bad.TargetBlock = tb;
+                        bad.Src = template.Elements.Count > 0 ? template.Elements[0] : null;
+                        bad.Dst = null;
+                        bad.Status = "结构异常";
+                        plan.Pairs.Add(bad);
+                        plan.MissingCount++;
+                        continue;
+                    }
                 }
 
                 // 自定义对话框：让重复段落调用同一套 OPENMERCHANTBIGDLG 参数（对话框 + 坐标）
@@ -916,85 +963,265 @@ namespace ScriptCoordOverlay
                     }
                 }
 
-                for (int j = 0; j < template.Elements.Count; j++)
+                if (exact)
                 {
-                    ScriptTag src = template.Elements[j];
-                    ScriptTag dst = tb.Elements[j];
-                    ParaPair p = new ParaPair();
-                    p.TargetBlock = tb;
-                    p.Src = src;
-                    p.Dst = dst;
+                    for (int j = 0; j < template.Elements.Count; j++)
+                        AddElementPair(plan, tb, template.Elements[j], tb.Elements[j], followAmp);
+                }
+                else
+                {
+                    for (int li = 0; li < tplLines.Count; li++)
+                    {
+                        List<ScriptTag> a = tplLines[li];
+                        List<ScriptTag> b = dstLines[li];
+                        bool[] matched = new bool[a.Count];
+                        bool[] used = new bool[b.Count];
 
-                    bool sameKind = src.Kind == dst.Kind;
-                    bool convertible = followAmp && dst.IsShorthand && src.HasCoord &&
-                                       (src.Kind == ElementKind.Text ||
-                                        (HasLink(src.Options) && HasLink(dst.Options)));
+                        List<int[]> pairs = AlignLine(a, b);
+                        foreach (int[] pr in pairs)
+                        {
+                            AddElementPair(plan, tb, a[pr[0]], b[pr[1]], followAmp);
+                            matched[pr[0]] = true;
+                            used[pr[1]] = true;
+                        }
 
-                    if (dst.IsPlain)
-                    {
-                        // 标签外的纯文字：套上 <&Text:文字:X:Y/选项>
-                        if (followAmp && src.Kind == ElementKind.Text && src.HasCoord)
+                        // 剩下没配上的，按顺序补配（同为文字类或同种控件）
+                        int q = 0;
+                        for (int k = 0; k < a.Count; k++)
                         {
-                            p.Status = "补全";
-                            plan.ChangeCount++;
-                            plan.CompleteCount++;
+                            if (matched[k]) continue;
+                            while (q < b.Count && used[q]) q++;
+                            if (q >= b.Count) break;
+                            if (!CompatiblePair(a[k], b[q])) continue;
+
+                            AddElementPair(plan, tb, a[k], b[q], followAmp);
+                            matched[k] = true;
+                            used[q] = true;
                         }
-                        else
+
+                        for (int k = 0; k < a.Count; k++)
                         {
-                            p.Status = "跳过";
-                        }
-                    }
-                    else if (dst.Kind == ElementKind.Text && HasLink(dst.Options) &&
-                             HasLink(src.Options) && src.Kind != ElementKind.Text && src.HasCoord)
-                    {
-                        // 模板把文字按钮换成了图像按钮（<&imgex:…/@跳转>）：
-                        // 目标按钮整体替换成模板的按钮，只保留目标自己的 @ 跳转
-                        p.Status = "替换";
-                        plan.ChangeCount++;
-                        plan.ButtonChanges++;
-                    }
-                    else if (dst.IsShorthand)
-                    {
-                        if (convertible)
-                        {
-                            p.Status = "补全";       // 简写文本 → <&Text:文字:X:Y/选项>
-                            plan.ChangeCount++;
-                            plan.CompleteCount++;
-                        }
-                        else if (!src.HasCoord || !followAmp)
-                        {
-                            p.Status = "跳过";       // 模板没有坐标，或未启用“写法跟随模板”
-                        }
-                        else
-                        {
-                            p.Status = "种类不同";
-                            plan.KindMismatch++;
+                            if (matched[k]) continue;
+                            ParaPair miss = new ParaPair();
+                            miss.TargetBlock = tb;
+                            miss.Src = a[k];
+                            miss.Dst = null;
+                            miss.Status = "缺失";
+                            plan.MissingCount++;
+                            plan.Pairs.Add(miss);
                         }
                     }
-                    else if (!sameKind)
-                    {
-                        p.Status = "种类不同";
-                        plan.KindMismatch++;
-                    }
-                    else if (!src.HasCoord || !dst.HasCoord)
-                    {
-                        p.Status = "跳过";           // 例如 ITEMBOX 暂不识别坐标
-                    }
-                    else if (src.X == dst.X && src.Y == dst.Y &&
-                             (!followAmp || src.HasAmp == dst.HasAmp))
-                    {
-                        p.Status = "相同";
-                        plan.SameCount++;
-                    }
-                    else
-                    {
-                        p.Status = "覆盖";
-                        plan.ChangeCount++;
-                    }
-                    plan.Pairs.Add(p);
                 }
             }
             return plan;
+        }
+
+        /// 文字类控件之间可以互相补全；其它控件要求种类一致
+        private static bool CompatiblePair(ScriptTag a, ScriptTag b)
+        {
+            if (a.Kind == b.Kind) return true;
+            bool ta = a.Kind == ElementKind.Text || a.IsPlain;
+            bool tb = b.Kind == ElementKind.Text || b.IsPlain;
+            return ta && tb;
+        }
+
+        private static void AddElementPair(ParaPlan plan, ScriptBlock tb, ScriptTag src, ScriptTag dst, bool followAmp)
+        {
+            ParaPair p = new ParaPair();
+            p.TargetBlock = tb;
+            p.Src = src;
+            p.Dst = dst;
+
+            bool sameKind = src.Kind == dst.Kind;
+            bool convertible = followAmp && dst.IsShorthand && src.HasCoord &&
+                               (src.Kind == ElementKind.Text ||
+                                (HasLink(src.Options) && HasLink(dst.Options)));
+
+            if (dst.IsPlain)
+            {
+                // 标签外的纯文字：套上 <&Text:文字:X:Y/选项>
+                if (followAmp && src.Kind == ElementKind.Text && src.HasCoord)
+                {
+                    p.Status = "补全";
+                    plan.ChangeCount++;
+                    plan.CompleteCount++;
+                }
+                else
+                {
+                    p.Status = "跳过";
+                }
+            }
+            else if (dst.Kind == ElementKind.Text && HasLink(dst.Options) &&
+                     HasLink(src.Options) && src.Kind != ElementKind.Text && src.HasCoord)
+            {
+                // 模板把文字按钮换成了图像按钮（<&imgex:…/@跳转>）：
+                // 目标按钮整体替换成模板的按钮，只保留目标自己的 @ 跳转
+                p.Status = "替换";
+                plan.ChangeCount++;
+                plan.ButtonChanges++;
+            }
+            else if (dst.IsShorthand)
+            {
+                if (convertible)
+                {
+                    p.Status = "补全";       // 简写文本 → <&Text:文字:X:Y/选项>
+                    plan.ChangeCount++;
+                    plan.CompleteCount++;
+                }
+                else if (!src.HasCoord || !followAmp)
+                {
+                    p.Status = "跳过";       // 模板没有坐标，或未启用“写法跟随模板”
+                }
+                else
+                {
+                    p.Status = "种类不同";
+                    plan.KindMismatch++;
+                }
+            }
+            else if (!sameKind)
+            {
+                p.Status = "种类不同";
+                plan.KindMismatch++;
+            }
+            else if (!src.HasCoord || !dst.HasCoord)
+            {
+                p.Status = "跳过";           // 例如 ITEMBOX 暂不识别坐标
+            }
+            else if (src.X == dst.X && src.Y == dst.Y &&
+                     (!followAmp || src.HasAmp == dst.HasAmp))
+            {
+                p.Status = "相同";
+                plan.SameCount++;
+            }
+            else
+            {
+                p.Status = "覆盖";
+                plan.ChangeCount++;
+            }
+            plan.Pairs.Add(p);
+        }
+
+        /// 按行分组（同一行的控件放一起）
+        private static List<List<ScriptTag>> LineGroups(ScriptBlock b)
+        {
+            List<List<ScriptTag>> lines = new List<List<ScriptTag>>();
+            int cur = -1;
+            List<ScriptTag> list = null;
+            foreach (ScriptTag t in b.Elements)
+            {
+                if (t.LineNo != cur)
+                {
+                    list = new List<ScriptTag>();
+                    lines.Add(list);
+                    cur = t.LineNo;
+                }
+                list.Add(t);
+            }
+            return lines;
+        }
+
+        /// 两行控件按文字相似度做序列对齐
+        private static List<int[]> AlignLine(List<ScriptTag> a, List<ScriptTag> b)
+        {
+            int n = a.Count;
+            int m = b.Count;
+            double[,] dp = new double[n + 1, m + 1];
+            bool[,] take = new bool[n + 1, m + 1];
+
+            for (int i = 1; i <= n; i++)
+            {
+                for (int j = 1; j <= m; j++)
+                {
+                    double s = Similarity(a[i - 1], b[j - 1]);
+                    bool ok = s >= 0.35;
+                    double diag = dp[i - 1, j - 1] + (ok ? s : -1000);
+                    double up = dp[i - 1, j];
+                    double left = dp[i, j - 1];
+                    double best = Math.Max(Math.Max(up, left), diag);
+                    dp[i, j] = best;
+                    take[i, j] = ok && best == diag;
+                }
+            }
+
+            List<int[]> pairs = new List<int[]>();
+            int x = n, y = m;
+            while (x > 0 && y > 0)
+            {
+                if (take[x, y])
+                {
+                    pairs.Add(new int[] { x - 1, y - 1 });
+                    x--;
+                    y--;
+                }
+                else if (dp[x - 1, y] >= dp[x, y - 1]) x--;
+                else y--;
+            }
+            pairs.Reverse();
+            return pairs;
+        }
+
+        /// 两个段落整体像不像（0~1），只用于“差一两个控件”的近似归组
+        private static double FuzzyScore(ScriptBlock a, ScriptBlock b)
+        {
+            List<List<ScriptTag>> la = LineGroups(a);
+            List<List<ScriptTag>> lb = LineGroups(b);
+            if (la.Count != lb.Count || la.Count == 0) return 0;
+
+            int matched = 0;
+            int minTotal = 0;
+            double sum = 0;
+            for (int i = 0; i < la.Count; i++)
+            {
+                minTotal += Math.Min(la[i].Count, lb[i].Count);
+                List<int[]> pairs = AlignLine(la[i], lb[i]);
+                matched += pairs.Count;
+                foreach (int[] p in pairs) sum += Similarity(la[i][p[0]], lb[i][p[1]]);
+            }
+
+            if (matched < 2) return 0;
+            if (matched < (int)Math.Ceiling(minTotal * 0.6)) return 0;
+            // 能配上多少比例的控件，比“平均像不像”更适合判断同构段落
+            return (double)matched / Math.Max(a.Elements.Count, b.Elements.Count);
+        }
+
+        private static double Similarity(ScriptTag a, ScriptTag b)
+        {
+            string x = Normalize(a.Text);
+            string y = Normalize(b.Text);
+            if (x.Length == 0 && y.Length == 0) return 1;
+            if (x.Length == 0 || y.Length == 0) return 0;
+            if (x == y) return 1;
+            int d = Levenshtein(x, y);
+            return 1.0 - (double)d / Math.Max(x.Length, y.Length);
+        }
+
+        private static string Normalize(string s)
+        {
+            if (s == null) return "";
+            StringBuilder sb = new StringBuilder();
+            foreach (char c in s)
+            {
+                if (char.IsDigit(c) || char.IsWhiteSpace(c)) continue;
+                if ("【】[]()（）{}<>，,。.、：:；;！!？?/\\-_".IndexOf(c) >= 0) continue;
+                sb.Append(c);
+            }
+            return sb.ToString();
+        }
+
+        private static int Levenshtein(string a, string b)
+        {
+            int n = a.Length;
+            int m = b.Length;
+            int[,] d = new int[n + 1, m + 1];
+            for (int i = 0; i <= n; i++) d[i, 0] = i;
+            for (int j = 0; j <= m; j++) d[0, j] = j;
+            for (int i = 1; i <= n; i++)
+                for (int j = 1; j <= m; j++)
+                {
+                    int cost = a[i - 1] == b[j - 1] ? 0 : 1;
+                    d[i, j] = Math.Min(Math.Min(d[i - 1, j] + 1, d[i, j - 1] + 1), d[i - 1, j - 1] + cost);
+                }
+            return d[n, m];
         }
 
         private static bool HasLink(string options)
