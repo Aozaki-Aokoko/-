@@ -21,6 +21,7 @@ if (Test-Path $legacy) { Remove-Item $legacy -Force -ErrorAction SilentlyContinu
 
 & $csc /nologo /target:winexe /platform:anycpu /optimize+ /codepage:65001 `
     "/win32manifest:$PSScriptRoot\app.manifest" `
+    "/win32icon:$PSScriptRoot\app.ico" `
     "/out:$out" `
     /r:System.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll `
     "$PSScriptRoot\Program.cs"

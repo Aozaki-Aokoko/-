@@ -227,6 +227,7 @@ OPENMERCHANTBIGDLG 75 1334 0 4 0 0 1 542 4 1
 ├─ dist\传奇脚本同步器.exe      ← 直接运行这个
 ├─ src\Program.cs             ← 源码（单文件 C# WinForms）
 ├─ src\app.manifest           ← 高分屏 DPI 清单
+├─ src\app.ico                ← 程序/窗口图标
 ├─ src\build.ps1              ← 改动源码后重新编译
 ├─ docs\preview.png           ← 跨脚本页
 ├─ docs\preview-para.png      ← 段落页

@@ -2812,6 +2812,10 @@ namespace ScriptCoordOverlay
 
         public MainForm(bool paraTab)
         {
+            // 窗口/任务栏图标取自 exe 自身嵌入的图标（build.ps1 的 /win32icon）
+            try { Icon = System.Drawing.Icon.ExtractAssociatedIcon(Application.ExecutablePath); }
+            catch { }
+
             BuildUi();
             if (paraTab) _tabs.SelectedIndex = 1;
             LoadSettings();
