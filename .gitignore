@@ -1,0 +1,17 @@
+# 构建产物
+bin/
+obj/
+*.pdb
+*.user
+
+# 运行期生成物（覆盖时自动备份/记录）
+*.坐标覆盖备份-*.txt
+*.段落覆盖记录.txt
+*.坐标覆盖记录.txt
+
+# 系统/编辑器
+.vs/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store

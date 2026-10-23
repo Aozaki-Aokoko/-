@@ -1,0 +1,11 @@
+* text=auto
+
+*.cs    text
+*.ps1   text
+*.bat   text
+*.md    text
+*.json  text
+
+*.png   binary
+*.exe   binary
+*.dll   binary
