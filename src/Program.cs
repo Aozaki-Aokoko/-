@@ -960,7 +960,8 @@ namespace ScriptCoordOverlay
                         if (ordered[j].Blocks.Count == 0) continue;
                         ScriptBlock a = ordered[i].Blocks[0];
                         ScriptBlock b = ordered[j].Blocks[0];
-                        if (Math.Abs(a.Elements.Count - b.Elements.Count) > 2) continue;
+                        // 不再限制控件总数差：纯文字“。”这类会让页与页差好几个控件，
+                        // 能否归组交给 FuzzyScore（行数相同 + 文字匹配比例）判断。
                         if (FuzzyScore(a, b) < 0.55) continue;
 
                         ordered[i].Blocks.AddRange(ordered[j].Blocks);
@@ -1044,11 +1045,10 @@ namespace ScriptCoordOverlay
 
                 if (!exact)
                 {
-                    // 控件数只差一两个时，按行 + 文字相似度对齐（逗号写进标签里之类）
+                    // 行数一致就按行 + 文字相似度对齐；控件数允许因纯文字“。”而不同
                     tplLines = LineGroups(template);
                     dstLines = LineGroups(tb);
-                    if (tplLines.Count == 0 || tplLines.Count != dstLines.Count ||
-                        Math.Abs(tb.Elements.Count - template.Elements.Count) > 2)
+                    if (tplLines.Count == 0 || tplLines.Count != dstLines.Count)
                     {
                         plan.SkippedBlocks++;
                         plan.Warnings.Add(string.Format(
@@ -1172,7 +1172,16 @@ namespace ScriptCoordOverlay
             if (a.Kind == b.Kind) return true;
             bool ta = a.Kind == ElementKind.Text || a.IsPlain;
             bool tb = b.Kind == ElementKind.Text || b.IsPlain;
-            return ta && tb;
+            if (ta && tb) return true;
+
+            // 一边是带 @ 跳转的图像/其它按钮，另一边是带 @ 跳转的文字按钮：
+            // 允许配对，交给“替换”分支把文字按钮整体换成图像按钮
+            if (HasLink(a.Options) && HasLink(b.Options) &&
+                ((a.Kind != ElementKind.Text && b.Kind == ElementKind.Text) ||
+                 (a.Kind == ElementKind.Text && b.Kind != ElementKind.Text)))
+                return true;
+
+            return false;
         }
 
         private static bool IsTextual(ScriptTag t)
